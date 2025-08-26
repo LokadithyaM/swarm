@@ -1,11 +1,10 @@
 "use client"
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
-import { Heart, MessageCircle, Repeat2, Share, Bot, User, Sparkles } from "lucide-react"
-import { useRef } from "react"
+import { Heart, MessageCircle, Repeat2, Share, Bot, User, Sparkles, Loader2 } from "lucide-react"
 
 interface Reply {
   _id: string
@@ -15,6 +14,7 @@ interface Reply {
   content: string
   comments: Reply[]
   timestamp: string
+  isLiked: boolean
   likeCount: number
   createdAt: string
   updatedAt: string
@@ -33,12 +33,14 @@ interface Post {
   updatedAt: string
   timestamp: string
   likeCount: number
+  isLiked: boolean
   replyCount: number
   comments: Reply[]
   __v: number
 }
 
 const API_BASE = "http://localhost:8080/api"
+const POSTS_PER_PAGE = 50
 
 export default function SocialFeed() {
   const [posts, setPosts] = useState<Post[]>([])
@@ -49,104 +51,135 @@ export default function SocialFeed() {
   const [isReplying, setIsReplying] = useState<{ [key: string]: boolean }>({})
   const [likedPosts, setLikedPosts] = useState<Set<string>>(new Set())
   const [likedReplies, setLikedReplies] = useState<Set<string>>(new Set())
+  const [currentPage, setCurrentPage] = useState(0)
+  const [hasMorePosts, setHasMorePosts] = useState(true)
+  const [isLoadingMore, setIsLoadingMore] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
+  const scrollAreaRef = useRef<HTMLDivElement>(null)
+
+  const handleScroll = useCallback(
+    (e: Event) => {
+      const target = e.target as HTMLDivElement
+      if (!target) return
+
+      const { scrollTop, scrollHeight, clientHeight } = target
+      const isNearBottom = scrollTop + clientHeight >= scrollHeight - 100
+
+      if (isNearBottom && hasMorePosts && !isLoadingMore) {
+        loadMorePosts()
+      }
+    },
+    [hasMorePosts, isLoadingMore],
+  )
+
+  const loadMorePosts = useCallback(async () => {
+    if (!hasMorePosts || isLoadingMore) return
+
+    setIsLoadingMore(true)
+    try {
+      const response = await fetch(
+        `${API_BASE}/posts?userId=68a6ea1b9030bcf69c3c965b&page=${currentPage + 1}&limit=${POSTS_PER_PAGE}`,
+      )
+      const data = await response.json()
+
+      if (data.success && data.posts.length > 0) {
+        setPosts((prev) => [...prev, ...data.posts])
+        setCurrentPage((prev) => prev + 1)
+
+        if (data.posts.length < POSTS_PER_PAGE) {
+          setHasMorePosts(false)
+        }
+      } else {
+        setHasMorePosts(false)
+      }
+    } catch (error) {
+      console.error("Failed to load more posts:", error)
+    } finally {
+      setIsLoadingMore(false)
+    }
+  }, [currentPage, hasMorePosts, isLoadingMore])
 
   useEffect(() => {
-    const fetchPosts = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/posts`)
-        const data = await res.json()
-        if (data.success) {
-          console.log(data);
-          setPosts(data.posts)
-        }
-      } catch (error) {
-        console.error("Failed to fetch posts:", error)
-      }
-    }
-    fetchPosts()
-
-    // WebSocket for real-time updates
     wsRef.current = new WebSocket("ws://localhost:8080")
+    wsRef.current.onopen = () => {
+      wsRef.current?.send(
+        JSON.stringify({
+          type: "auth",
+          userId: "68a6ea1b9030bcf69c3c965b",
+          page: 0,
+          limit: POSTS_PER_PAGE,
+        }),
+      )
+    }
     wsRef.current.onmessage = (event) => {
       const msg = JSON.parse(event.data)
-      if (msg.type === "comment") {
-        setPosts(prev =>
-          prev.map(post =>
-            post._id === msg.postId
-              ? { ...post, comments: [...(post.comments || []), msg.comment] }
-              : post
-          )
+
+      if (msg.type === "init") {
+        console.log(msg.posts)
+        setPosts(msg.posts)
+        setHasMorePosts(msg.posts.length === POSTS_PER_PAGE)
+        setCurrentPage(0)
+      } else if (msg.type === "comment") {
+        setPosts((prev) =>
+          prev.map((post) =>
+            post._id === msg.postId ? { ...post, comments: [...(post.comments || []), msg.comment] } : post,
+          ),
         )
       } else if (msg.type === "post") {
         setPosts((prev) => [msg.post, ...prev])
+      } else if (msg.type === "initLikes") {
+        setLikedPosts(new Set(msg.likedPosts))
+        setLikedReplies(new Set(msg.likedReplies))
+      } else if (msg.type === "likeUpdate") {
+        setPosts((prev) =>
+          prev.map((post) => (post._id === msg.targetId ? { ...post, likeCount: msg.likeCount } : post)),
+        )
       }
     }
 
     return () => wsRef.current?.close()
   }, [])
 
-  const handlePost = async () => {
-    if (!newPost.trim()) return
-
-    setIsPosting(true)
-    try {
-      console.log("entering post");
-
-
-        wsRef.current?.send(
-          JSON.stringify({
-            type: "newPost",
-            authorId: "68a6ea1b9030bcf69c3c965b",
-            content: newPost,
-            authorType: "User",
-          }),
-        )
-        setNewPost("")
-    } catch (error) {
-      console.error("Failed to create post:", error)
-    } finally {
-      setIsPosting(false)
+  useEffect(() => {
+    const scrollElement = scrollAreaRef.current?.querySelector("[data-radix-scroll-area-viewport]")
+    if (scrollElement) {
+      scrollElement.addEventListener("scroll", handleScroll)
+      return () => scrollElement.removeEventListener("scroll", handleScroll)
     }
-  }
+  }, [handleScroll])
 
   const toggleLike = async (postId: string) => {
     const isLiked = likedPosts.has(postId)
 
     try {
       if (isLiked) {
-        await fetch(`${API_BASE}/likes`, {
-          method: "DELETE",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            userId: "user", // You might want to get this from auth context
-            targetId: postId,
-            targetType: "post",
+        console.log("unCliking the post")
+        wsRef.current?.send(
+          JSON.stringify({
+            type: "unlikePost",
+            userId: "68a6ea1b9030bcf69c3c965b",
+            postId,
+            targetType: "Post",
           }),
-        })
+        )
         setLikedPosts((prev) => {
           const newSet = new Set(prev)
           newSet.delete(postId)
           return newSet
         })
       } else {
-        await fetch(`${API_BASE}/likes`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            userId: "user", // You might want to get this from auth context
-            targetId: postId,
-            targetType: "post",
+        console.log("liking the post")
+        wsRef.current?.send(
+          JSON.stringify({
+            type: "likePost",
+            userId: "68a6ea1b9030bcf69c3c965b",
+            postId,
+            targetType: "Post",
           }),
-        })
+        )
         setLikedPosts((prev) => new Set([...prev, postId]))
       }
 
-      // Update post like count locally
       setPosts((prev) =>
         prev.map((post) =>
           post._id === postId ? { ...post, likeCount: isLiked ? post.likeCount - 1 : post.likeCount + 1 } : post,
@@ -162,38 +195,32 @@ export default function SocialFeed() {
 
     try {
       if (isLiked) {
-        await fetch(`${API_BASE}/likes`, {
-          method: "DELETE",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            userId: "user",
-            targetId: replyId,
-            targetType: "comment",
+        wsRef.current?.send(
+          JSON.stringify({
+            type: "unlikeReply",
+            userId: "68a6ea1b9030bcf69c3c965b",
+            postId,
+            replyId,
+            targetType: "Comment",
           }),
-        })
+        )
         setLikedReplies((prev) => {
           const newSet = new Set(prev)
           newSet.delete(replyId)
           return newSet
         })
       } else {
-        await fetch(`${API_BASE}/likes`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            userId: "user",
-            targetId: replyId,
-            targetType: "comment",
+        wsRef.current?.send(
+          JSON.stringify({
+            type: "likeReply",
+            userId: "68a6ea1b9030bcf69c3c965b",
+            replyId,
+            targetType: "Comment",
           }),
-        })
+        )
         setLikedReplies((prev) => new Set([...prev, replyId]))
       }
 
-      // Update reply like count locally
       setPosts((prev) =>
         prev.map((post) => {
           if (post._id === postId) {
@@ -231,24 +258,21 @@ export default function SocialFeed() {
   function buildCommentTree(comments: Reply[]): Reply[] {
     const map: Record<string, Reply & { comments: Reply[] }> = {}
     const roots: (Reply & { comments: Reply[] })[] = []
-  
-    // Init all with empty comments[]
-    comments.forEach(c => {
+
+    comments.forEach((c) => {
       map[c._id] = { ...c, comments: [] }
     })
-  
-    // Attach children
-    comments.forEach(c => {
+
+    comments.forEach((c) => {
       if (c.parentCommentId && map[c.parentCommentId]) {
         map[c.parentCommentId].comments.push(map[c._id])
       } else {
         roots.push(map[c._id])
       }
     })
-  
+
     return roots
   }
-  
 
   const handleReply = async (postId: string, parentReplyId?: string) => {
     const replyKey = parentReplyId ? `${postId}-${parentReplyId}` : postId
@@ -256,22 +280,21 @@ export default function SocialFeed() {
     if (!content) return
 
     setIsReplying((prev) => ({ ...prev, [replyKey]: true }))
-    console.log("commented");
+    console.log("commented")
 
     try {
-        wsRef.current?.send(
-          JSON.stringify({
-            type: "newReply",
-            postId,
-            parentReplyId,
-            content,
-            authorId: "68a6ea1b9030bcf69c3c965b",
-          }),
-        )
-        
+      wsRef.current?.send(
+        JSON.stringify({
+          type: "newReply",
+          postId,
+          parentReplyId,
+          content,
+          authorId: "68a6ea1b9030bcf69c3c965b",
+        }),
+      )
 
-        setReplyInputs((prev) => ({ ...prev, [replyKey]: "" }))
-        setShowReplyInput((prev) => ({ ...prev, [replyKey]: false }))
+      setReplyInputs((prev) => ({ ...prev, [replyKey]: "" }))
+      setShowReplyInput((prev) => ({ ...prev, [replyKey]: false }))
     } catch (error) {
       console.error("Failed to create reply:", error)
     } finally {
@@ -280,7 +303,7 @@ export default function SocialFeed() {
   }
 
   const formatTime = (date: string | Date) => {
-      if (!date) return "now"
+    if (!date) return "now"
     const d = typeof date === "string" ? new Date(date) : date
     const now = new Date()
     const diff = now.getTime() - d.getTime()
@@ -317,16 +340,11 @@ export default function SocialFeed() {
       }))
   }
   const getIndent = (depth: number) => {
-    const maxIndent = 2;      // how far right it can go (px)
-    const curve = 100;         // smaller = slower curve, larger = faster
-    return maxIndent * (1 - Math.exp(-curve * depth));
-  };
-  
-  
-  
-  
+    const maxIndent = 2 // how far right it can go (px)
+    const curve = 100 // smaller = slower curve, larger = faster
+    return maxIndent * (1 - Math.exp(-curve * depth))
+  }
 
-  
   const renderReplies = (comments: Reply[], postId: string, depth = 0) => {
     const sortedReplies = sortReplies(comments)
 
@@ -336,7 +354,6 @@ export default function SocialFeed() {
         className="flex gap-3 border-l-2 border-muted"
         style={{ paddingLeft: `${getIndent(depth)}px` }}
       >
-
         <Avatar className="w-6 h-6">
           <AvatarFallback className={reply.authorId?.username === "gemini" ? "bg-blue-100" : ""}>
             {reply.authorId?.username === "gemini" ? (
@@ -370,10 +387,10 @@ export default function SocialFeed() {
             <button
               onClick={() => toggleReplyLike(postId, reply._id)}
               className={`flex items-center gap-1 transition-colors ${
-                likedReplies.has(reply._id) ? "text-red-500" : "hover:text-red-500"
+                reply.isLiked ? "text-red-500" : "hover:text-red-500"
               }`}
             >
-              <Heart className={`w-3 h-3 ${likedReplies.has(reply._id) ? "fill-current" : ""}`} />
+              <Heart className={`w-3 h-3 ${reply.isLiked ? "fill-current" : ""}`} />
               <span className="text-xs">{reply.likeCount}</span>
             </button>
 
@@ -428,6 +445,29 @@ export default function SocialFeed() {
     ))
   }
 
+  const handlePost = async () => {
+    if (!newPost.trim()) return
+
+    setIsPosting(true)
+    try {
+      console.log("entering post")
+
+      wsRef.current?.send(
+        JSON.stringify({
+          type: "newPost",
+          authorId: "68a6ea1b9030bcf69c3c965b",
+          content: newPost,
+          authorType: "User",
+        }),
+      )
+      setNewPost("")
+    } catch (error) {
+      console.error("Failed to create post:", error)
+    } finally {
+      setIsPosting(false)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-background">
       <div className="max-w-2xl mx-auto border-x border-border min-h-screen">
@@ -463,8 +503,8 @@ export default function SocialFeed() {
         </div>
 
         {/* Feed */}
-        <ScrollArea className="flex-1">
-          {posts.length === 0 && (
+        <ScrollArea className="flex-1" ref={scrollAreaRef}>
+          {posts.length === 0 && !isLoadingMore && (
             <div className="text-center py-12 text-muted-foreground">
               <Sparkles className="w-12 h-12 mx-auto mb-4 opacity-50" />
               <p>Your feed is empty. Create your first post!</p>
@@ -475,7 +515,7 @@ export default function SocialFeed() {
             <div key={post._id} className="border-b border-border p-4 hover:bg-muted/50 transition-colors">
               <div className="flex gap-3">
                 <Avatar>
-                  <AvatarFallback className={post.authorId?.username === "gemini" ? "bg-blue-100" : "bg-gray-100" }>
+                  <AvatarFallback className={post.authorId?.username === "gemini" ? "bg-blue-100" : "bg-gray-100"}>
                     {post.authorId?.username === "gemini" ? (
                       <Bot className="w-4 h-4 text-blue-600" />
                     ) : (
@@ -514,10 +554,10 @@ export default function SocialFeed() {
                     <button
                       onClick={() => toggleLike(post._id)}
                       className={`flex items-center gap-2 transition-colors ${
-                        likedPosts.has(post._id) ? "text-red-500" : "hover:text-red-500"
+                        post.isLiked ? "text-red-500" : "hover:text-red-500"
                       }`}
                     >
-                      <Heart className={`w-4 h-4 ${likedPosts.has(post._id) ? "fill-current" : ""}`} />
+                      <Heart className={`w-4 h-4 ${post.isLiked ? "fill-current" : ""}`} />
                       <span className="text-sm">{post.likeCount}</span>
                     </button>
 
@@ -571,6 +611,21 @@ export default function SocialFeed() {
               </div>
             </div>
           ))}
+
+          {isLoadingMore && (
+            <div className="flex justify-center py-8">
+              <div className="flex items-center gap-2 text-muted-foreground">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>Loading more posts...</span>
+              </div>
+            </div>
+          )}
+
+          {!hasMorePosts && posts.length > 0 && (
+            <div className="text-center py-8 text-muted-foreground">
+              <p>You've reached the end of your feed!</p>
+            </div>
+          )}
         </ScrollArea>
       </div>
     </div>
